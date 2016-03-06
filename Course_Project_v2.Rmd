@@ -1,0 +1,242 @@
+---
+title: "Practical Machine Learning Course Project (revised version)."
+author: "Martin HEIN (m#)"
+date: '`r format(Sys.Date(), "%d %B %Y")`'
+output:
+  html_document:
+    fig_caption: yes
+    fig_height: 6
+    fig_width: 7
+    highlight: zenburn
+    number_sections: yes
+    theme: journal
+    toc: yes
+  pdf_document:
+    fig_caption: yes
+    fig_height: 4
+    fig_width: 7
+    highlight: zenburn
+    number_sections: yes
+    toc: yes
+  word_document:
+    fig_caption: yes
+    fig_height: 4
+    fig_width: 7
+    highlight: zenburn
+    number_sections: yes
+    toc: yes
+---
+<style type="text/css">
+    h1 {
+        font-size: 18pt;
+    }
+    h2 {
+        font-size: 16pt;
+    }
+    h3 {
+        font-size: 14pt;
+    }
+    h4 {
+        font-size: 12pt;
+    }
+    body {
+        font-size: 10pt;
+    }
+    td {
+        font-size: 9.5pt;
+    }
+    code.r {
+        font-size: 8pt;
+    }
+    pre {
+        font-size: 9pt;
+    }
+</style>
+```{r options, echo=FALSE, warning=FALSE, results="hide"}
+## define global settings
+library(knitr)
+opts_chunk$set(echo=TRUE, message=FALSE, warning=FALSE, results="show")
+pdf.options(useDingbats = TRUE)
+```
+*****
+# INTRODUCTION
+## BACKGROUND
+Using devices such as _Jawbone Up_, _Nike FuelBand_, and _Fitbit_ it is now possible to collect a large amount of data about personal activity relatively inexpensively. These type of devices are part of the quantified self movement – a group of enthusiasts who take measurements about themselves regularly to improve their health, to find patterns in their behavior, or because they are tech geeks. One thing that people regularly do is quantify how much of a particular activity they do, but they rarely quantify _how well they do it_. In this project, your goal will be to use data from accelerometers on the belt, forearm, arm, and dumbell of 6 participants. They were asked to perform barbell lifts correctly and incorrectly in 5 different ways. More information is available from the website here: [http://groupware.les.inf.puc-rio.br/har][datwle] (see the section on the _Weight Lifting Exercise Dataset_).
+
+## UNDERLYING DATA SET
+The training data for this project are available here: [https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv][pmltrain].
+
+The test data are available here: [https://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv][pmltest].
+
+The data for this project come from this source: [http://groupware.les.inf.puc-rio.br/har][datwle]. If you use the document you create for this class for any purpose please cite them as they have been very generous in allowing their data to be used for this kind of assignment.
+
+## EXPECTED SUBMISSION
+The goal of this project is to predict the manner in which they did the exercise. This is the _**```classe```**_ variable in the _**training set**_. A corresponding report has to be created, describing how the model was built, how cross validation has been applied, the expected out of sample error, and why the choices has been done the way they are. As a final step the prediction model will be facilitated to predict 20 different test cases.
+
+# SETUP
+## PREPARING THE ENVIRONMENT
+```{r setup-001}
+## load libraries
+library(data.table)
+library(lubridate)
+library(ggplot2)
+library(caret)
+library(gbm)
+library(parallel)
+library(doParallel)
+library(plyr)
+```
+
+## GETTING THE DATA SETS
+Let us start with retrieving and loading the underlying data set.
+
+```{r setup-002}
+urlTrain <- "https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv"
+urlTest <- "https://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv"
+
+datTrain <- fread(urlTrain, na.strings=c("NA","#DIV/0!",""))
+datTest <- fread(urlTest, na.strings=c("NA","#DIV/0!",""))
+
+datTStamp <- Sys.time()
+```
+
+```{r setup-003}
+dimTbl <- rbind(dim(datTrain), dim(datTest))
+colnames(dimTbl) <- c("observations", "variables")
+rownames(dimTbl) <- c("training", "testing")
+dimTbl
+```
+
+# PREPARING THE DATA SETS
+## REMOVING VARIABLES NOT REQUIRED
+First variable contains only the observation number, so we can dispose of this variable.
+
+```{r prepare-004}
+rmVar <- c("V1", "user_name", "raw_timestamp_part_1", "raw_timestamp_part_2", 
+           "cvtd_timestamp", "new_window", "num_window")
+datTrain <- datTrain[, -rmVar, with=FALSE]
+datTest <- datTest[, -rmVar, with=FALSE]
+```
+
+Let us also remove any variable containing NA values as much as _**at least 60%**_ of all the observations of that particular variable.
+
+```{r prepare-005}
+DTnaVar <- function(dt) {
+    cs <- colSums(sapply(dt, is.na))
+    dt[, (cs / nrow(dt) < 0.6), with=FALSE]
+} # DTnaVar
+
+datTrain <- DTnaVar(datTrain)
+datTest <- DTnaVar(datTest)
+```
+
+## REMOVING NEAR ZERO VARIANCE VARIABLES
+```{r prepare-003}
+DTnearZeroVar <- function(dt) {
+    nzvDT <- nearZeroVar(dt, saveMetrics=TRUE)
+    dt[, nzvDT$nzv == FALSE, with=FALSE]
+} # DTnearZeroVar
+
+datTrain <- DTnearZeroVar(datTrain)
+datTest <- DTnearZeroVar(datTest)
+```
+
+## HARMONISE VARIABLES IN DATA SETS
+Next let us focus on only those variables present across all data sets.
+
+```{r harmonise-001}
+clsTrain <- datTrain[, classe]
+datTrain <- datTrain[, colnames(datTrain) %in% colnames(datTest), with=FALSE]
+datTrain[, classe := clsTrain]
+
+datTest <- datTest[, colnames(datTest) %in% colnames(datTest), with=FALSE]
+```
+
+## SETTING VARIABLE CLASSES IN DATA SETS
+```{r ckass-001}
+datTrain[, classe := as.factor(classe)]
+```
+
+## PARTITIONING THE DATA SET
+As a final step, we will split the _**training data set**_ into a _**(new) training set**_ and a _**(testing) validation set**_, against which we well test the model to build.
+
+```{r partition-001}
+inTrain <- createDataPartition(y=datTrain$classe, p=0.6, list=FALSE)
+datTrainNew <- datTrain[inTrain, ]
+datValid <- datTrain[-inTrain, ]
+```
+
+```{r partition-002}
+dimTbl <- rbind(dim(datTrain), dim(datTrainNew), dim(datValid), dim(datTest))
+colnames(dimTbl) <- c("observations", "variables")
+rownames(dimTbl) <- c("(orignal) training set", "new training set", "(new testing) validation set", "(original) testing set")
+dimTbl
+```
+
+# BUILDING A MODEL
+## CHOSING A MODELLING APPROACH
+Having the data sets thus prepared, we are now ready to build our model.
+
+As our training data set comprises of `r length(datTrain)` variables, which might be of a possibly weak nature, our model will be **pursuing a boosting approach**.
+
+## BUiLDING THE MODEL WITH CROSS-VALIDATION
+There are various ways of cross-validating a prediction model, one of these would be _**k-fold cross-validation**_, which will be facilitated in our case, using _**10 folds**_.
+
+```{r model-001}
+set.seed(20160306)
+
+## setup parallel processing
+clustFit <- makeCluster(detectCores() - 1)
+registerDoParallel(clustFit)
+
+## define training control
+ctrlTrain <- trainControl(method="cv", number=10,classProbs=TRUE, 
+                          savePredictions=TRUE, allowParallel=TRUE)
+
+## fit the model
+#modFit <- train(classe ~ ., method="gbm", data=datTrainNew, trControl=ctrlTrain, verbose=FALSE)
+modFit <- readRDS(file.path(".", "modFit.RDS"))
+
+## stop parallel processing
+stopCluster(clustFit)
+```
+
+```{r model-002}
+## summarize results
+print(modFit)
+```
+
+In order to save computing power and time, the model will get save upon completion, so that it can be read from file.
+
+```{r model-003}
+saveRDS(modFit, file.path(".", "modFit.RDS"))
+```
+
+## EVALUATING THE MODEL
+Next we will evaluate the accuracy of our model by applying it to the validation data set.
+
+```{r evaluate-001}
+predFitValid <- predict(modFit, newdata=datValid)
+accFitValid <- confusionMatrix(predFitValid, datValid[, classe])$overall[1]
+```
+
+This model applied to the validation data set will render an accurary of `r format(round(accFitValid*100, 2), scientific=FALSE)`%.
+
+We also will investigate the imporance of the various variable and the significance in contributing to the model.
+
+```{r evaluate-002}
+varImp(modFit)
+```
+
+# PREDICTING TEST CASES
+As a final step, we will predict some test cases based upon our prediction model.
+
+```{r predict-001}
+(predFitTest <- predict(modFit, newdata=datTest))
+predTest <- cbind(datTest, predFitTest)
+```
+
+*****
+[datwle]: <http://groupware.les.inf.puc-rio.br/har>
+[pmltrain]: <https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv>
+[pmltest]: <https://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv>
